@@ -27,6 +27,13 @@ from server import GameServer
 from client import GameClient
 
 
+def color_enabled(args):
+    """Honor --no-color and the NO_COLOR convention."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    return not getattr(args, "no_color", False)
+
+
 def default_username(provided=None):
     """A sensible prefill for the login screen's username field."""
     candidates = [provided] + [os.environ.get(v) for v in
@@ -75,6 +82,7 @@ async def run_host(args):
             admin_token=admin_token,
             host_hint=join_hint,
             prefill_username=default_username(args.name),
+            color=color_enabled(args),
         )
         try:
             await client.run()
@@ -129,6 +137,7 @@ async def run_join(args):
         uri=f"ws://{host}:{args.port}",
         host_hint=join_hint,
         prefill_username=default_username(args.name),
+        color=color_enabled(args),
     )
     await client.run()
 
@@ -171,6 +180,8 @@ def build_parser():
     host.add_argument("--subnet", default=None,
                       help="LAN subnet hint to pick the right interface, e.g. "
                            "192.168.20 or 10.0.0.0/24 (also $TYPERACER_SUBNET)")
+    host.add_argument("--no-color", action="store_true",
+                      help="disable colors (also respects the NO_COLOR env var)")
     host.add_argument("--no-discovery", action="store_true",
                       help="disable UDP auto-discovery responder")
 
@@ -184,6 +195,8 @@ def build_parser():
     join.add_argument("--subnet", default=None,
                       help="LAN subnet hint for auto-discovery, e.g. 192.168.20 "
                            "or 10.0.0.0/24 (also $TYPERACER_SUBNET)")
+    join.add_argument("--no-color", action="store_true",
+                      help="disable colors (also respects the NO_COLOR env var)")
 
     disc = sub.add_parser("discover", help="list hosts found on the LAN")
     disc.add_argument("--discovery-port", type=int, default=P.DEFAULT_DISCOVERY_PORT,

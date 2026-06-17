@@ -12,6 +12,7 @@ Works on Linux/macOS (termios + os.read + select) and Windows (msvcrt).
 """
 
 import os
+import re
 import sys
 import shutil
 import threading
@@ -77,6 +78,21 @@ def is_interactive():
         return sys.stdin.isatty() and sys.stdout.isatty()
     except Exception:
         return False
+
+
+_SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
+# Keep structural attributes (reset/bold/dim/underline/reverse + their resets);
+# drop foreground/background colors. Cursor/clear escapes (\x1b[...K/H/J) are not
+# 'm' sequences, so they pass through untouched.
+_KEEP_SGR = {"0", "1", "2", "4", "7", "22", "23", "24", "27"}
+
+
+def strip_color(text):
+    """Remove ANSI color codes but keep bold/dim/underline/reverse (no-color mode)."""
+    def repl(m):
+        kept = [p for p in m.group(1).split(";") if p in _KEEP_SGR]
+        return "\x1b[" + ";".join(kept) + "m" if kept else ""
+    return _SGR_RE.sub(repl, text)
 
 
 def enable_ansi():

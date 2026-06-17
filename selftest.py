@@ -11,6 +11,7 @@ Run:  python selftest.py
 """
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -24,8 +25,11 @@ import server as server_mod
 from server import GameServer
 from accounts import AccountStore
 
-# Skip the real 3-2-1 wait so the suite runs quickly.
+# Skip the real 3-2-1 wait so the suite runs quickly, and lift the anti-cheat
+# rate cap so the instant-finish bots aren't clamped (a dedicated scenario tests
+# the cap with a realistic value).
 server_mod.COUNTDOWN_SECONDS = 0
+server_mod.MAX_CPS = 1e9
 
 TOKEN = "TESTTOKEN"
 _failures = []
@@ -52,9 +56,14 @@ class Bot:
         self.auth_error = None
         self.latest = None
         self.leaderboard_rows = None
+        self.profile = None
+        self.history_rows = None
+        self.closed_code = None
         self._authed = asyncio.Event()
         self._updated = asyncio.Event()
         self._lb = asyncio.Event()
+        self._profile_ev = asyncio.Event()
+        self._history_ev = asyncio.Event()
         self._reader = None
 
     async def _auth(self, uri, msg):
@@ -103,14 +112,42 @@ class Bot:
                 elif t == P.S_LEADERBOARD:
                     self.leaderboard_rows = msg.get("rows", [])
                     self._lb.set()
+                elif t == P.S_PROFILE:
+                    self.profile = msg
+                    self._profile_ev.set()
+                elif t == P.S_HISTORY:
+                    self.history_rows = msg.get("rows", [])
+                    self._history_ev.set()
         except ConnectionClosed:
-            pass
+            self.closed_code = getattr(self.ws, "close_code", None)
 
-    async def request_leaderboard(self, metric="best_wpm"):
+    async def request_leaderboard(self, metric="best_wpm", mode=None, category=None):
         self._lb.clear()
-        await self.send({"type": P.C_LEADERBOARD, "metric": metric})
+        await self.send({"type": P.C_LEADERBOARD, "metric": metric,
+                         "mode": mode, "category": category})
         await asyncio.wait_for(self._lb.wait(), timeout=5)
         return self.leaderboard_rows
+
+    async def request_profile(self, target_id=None):
+        self._profile_ev.clear()
+        await self.send({"type": P.C_PROFILE, "target_id": target_id})
+        await asyncio.wait_for(self._profile_ev.wait(), timeout=5)
+        return self.profile
+
+    async def request_history(self):
+        self._history_ev.clear()
+        await self.send({"type": P.C_HISTORY})
+        await asyncio.wait_for(self._history_ev.wait(), timeout=5)
+        return self.history_rows
+
+    async def chat(self, text):
+        await self.send({"type": P.C_CHAT, "text": text})
+
+    async def config(self, **fields):
+        await self.send({"type": P.C_CONFIG, **fields})
+
+    async def kick(self, target_id):
+        await self.send({"type": P.C_KICK, "target_id": target_id})
 
     async def send(self, obj):
         await self.ws.send(P.encode(obj))
@@ -457,16 +494,26 @@ async def scenario_register_login_persist():
         await good.close()
 
 
-async def scenario_double_login_blocked():
-    print("scenario: the same account cannot be logged in twice")
+async def scenario_reconnection_takeover():
+    print("scenario: re-logging into an account takes over the live session")
     async with Harness() as h:
         one = Bot("One")
         await one.register(h.uri, "dupe_user", "pw1234", token=TOKEN)
+        await one.wait_for(lambda s: any(p["name"] == "dupe_user"
+                                         for p in s["players"]))
         two = Bot("Two")
         ok = await two.login(h.uri, "dupe_user", "pw1234")
-        check(not ok and "already logged in" in (two.auth_error or ""),
-              "second concurrent login is blocked")
-        await one.close()
+        check(ok and two.account == "dupe_user",
+              "second login succeeds (takeover, not rejected)")
+        # the original connection is closed by the server with CLOSE_REPLACED
+        await asyncio.sleep(0.3)
+        check(one.closed_code == P.CLOSE_REPLACED,
+              "original connection is evicted with the 'replaced' close code")
+        # the account appears exactly once in the roster after takeover
+        snap = await two.wait_for(lambda s: any(p["name"] == "dupe_user"
+                                                for p in s["players"]))
+        same = [p for p in snap["players"] if p["name"] == "dupe_user"]
+        check(len(same) == 1, "account appears once after takeover")
         await two.close()
 
 
@@ -532,6 +579,293 @@ async def scenario_guest_no_stats():
         await g.close()
 
 
+async def scenario_config_and_timed_mode():
+    print("scenario: host config + TIMED mode (deadline-ranked by chars)")
+    async with Harness() as h:
+        admin = Bot("Admin")
+        peon = Bot("Peon")
+        await admin.start(h.uri, TOKEN)
+        await peon.start(h.uri)
+
+        # C_CONFIG: admin-only field validation
+        await admin.config(mode="timed", length="short", category="quotes",
+                           time_limit=15)
+        await admin.wait_for(lambda s: s.get("config", {}).get("mode") == "timed")
+        cfg = admin.latest["config"]
+        check(cfg["mode"] == "timed" and cfg["length"] == "short"
+              and cfg["category"] == "quotes" and cfg["time_limit"] == 15,
+              "admin config is applied and broadcast")
+        await admin.config(time_limit=999)   # invalid -> ignored
+        await asyncio.sleep(0.1)
+        check(admin.latest["config"]["time_limit"] == 15,
+              "out-of-range config value is ignored")
+        await peon.config(mode="classic")    # non-admin -> ignored
+        await asyncio.sleep(0.1)
+        check(admin.latest["config"]["mode"] == "timed",
+              "non-admin config is ignored")
+
+        # shrink the deadline for a fast test, then force-start
+        h.gs.config["time_limit"] = 1
+        await admin.send({"type": P.C_START})
+        state = await admin.wait_for(racing)
+        check(state.get("mode") == "timed" and "time_left" in state,
+              "timed race exposes mode + time_left")
+        await admin.progress(90)             # admin types more chars
+        await peon.progress(30)
+        final = await admin.wait_for(results, timeout=5)
+        ap = next(p for p in final["players"] if p["name"] == "Admin")
+        pp = next(p for p in final["players"] if p["name"] == "Peon")
+        check(not ap["finished"] and not pp["finished"],
+              "nobody 'finishes' a timed race")
+        check(ap["place"] == 1 and pp["place"] == 2,
+              "timed race ranks by chars typed")
+        await admin.close()
+        await peon.close()
+
+
+async def scenario_survival_mode():
+    print("scenario: SURVIVAL sudden-death (typo eliminates)")
+    async with Harness() as h:
+        a = Bot("Alive")
+        b = Bot("Doomed")
+        await a.start(h.uri, TOKEN)
+        await b.start(h.uri)
+        h.gs.config["mode"] = "survival"
+        h.gs.config["lives"] = 1
+        await a.send({"type": P.C_START})
+        state = await a.wait_for(racing)
+        text = state["text"]
+        check(state["players"][0]["lives"] == 1, "survival exposes lives")
+
+        await b.progress(8, errors=1)        # a typo with 1 life => eliminated
+        await a.wait_for(lambda s: any(p["name"] == "Doomed" and p["eliminated"]
+                                       for p in s["players"]))
+        await a.finish(text)                 # survivor finishes
+        final = await a.wait_for(results)
+        ap = next(p for p in final["players"] if p["name"] == "Alive")
+        bp = next(p for p in final["players"] if p["name"] == "Doomed")
+        check(bp["eliminated"] and bp["place"] == 2, "eliminated player ranks last")
+        check(ap["place"] == 1, "survivor wins")
+        await a.close()
+        await b.close()
+
+
+async def scenario_anticheat_clamp():
+    print("scenario: anti-cheat clamps an impossible instant finish")
+    saved = server_mod.MAX_CPS
+    server_mod.MAX_CPS = 25.0     # realistic ~300 WPM ceiling for this test
+    try:
+        async with Harness() as h:
+            cheat = Bot("Cheater")
+            await cheat.start(h.uri, TOKEN)
+            await cheat.ready(True)
+            state = await cheat.wait_for(racing)
+            n = state["text_len"]
+            await cheat.progress(n)          # claim the whole passage instantly
+            await asyncio.sleep(0.2)
+            me = cheat.player("Cheater")
+            check(me["pos"] < n and me["pos"] <= server_mod.ANTICHEAT_GRACE + 8,
+                  f"instant pos is clamped ({me['pos']} << {n})")
+            check(me["flagged"], "implausible progress is flagged")
+            check(not me["finished"] and cheat.latest["phase"] == P.PHASE_RACING,
+                  "cheater does not finish instantly")
+            await cheat.close()
+    finally:
+        server_mod.MAX_CPS = saved
+
+
+async def scenario_chat():
+    print("scenario: lobby chat with sanitization + rate limit")
+    async with Harness() as h:
+        a = Bot("Ann")
+        b = Bot("Bob")
+        await a.start(h.uri, TOKEN)
+        await b.start(h.uri)
+        await a.chat("hello everyone")
+        await b.wait_for(lambda s: any(c.get("text") == "hello everyone"
+                                       for c in s.get("chat", [])))
+        check(True, "chat message reaches other players")
+        sysmsgs = [c for c in b.latest.get("chat", []) if c.get("kind") == "system"]
+        check(any("joined" in c["text"] for c in sysmsgs), "join system message present")
+        # ANSI/control characters are stripped
+        await asyncio.sleep(0.6)
+        await a.chat("x\x1b[31mY\x07Z")
+        await b.wait_for(lambda s: any(c.get("name") == "Ann" and "Y" in c.get("text", "")
+                                       and "\x1b" not in c.get("text", "")
+                                       for c in s.get("chat", []) if c.get("kind") == "user"))
+        check(True, "control characters are stripped from chat")
+        # rate limit: a second immediate message is dropped
+        await asyncio.sleep(0.6)              # clear the previous send's cooldown
+        await a.chat("first_fast")
+        await a.chat("second_fast")
+        await asyncio.sleep(0.2)
+        texts_seen = [c["text"] for c in b.latest.get("chat", [])]
+        check("first_fast" in texts_seen and "second_fast" not in texts_seen,
+              "rapid second chat is rate-limited")
+        await a.close()
+        await b.close()
+
+
+async def scenario_profile_and_history():
+    print("scenario: profile + match history request/response")
+    async with Harness() as h:
+        a = Bot("A")
+        g = Bot("G")
+        await a.register(h.uri, "profiler", "pw1234", token=TOKEN)
+        await g.start(h.uri)                 # a guest
+        await a.ready(True)
+        await g.ready(True)
+        state = await a.wait_for(racing)
+        await a.finish(state["text"])
+        await g.finish(state["text"])
+        await a.wait_for(results)
+
+        prof = await a.request_profile()     # own profile
+        check(prof["found"] and prof["stats"] and prof["stats"]["races_played"] == 1,
+              "own profile returns full stats")
+        check("salt" not in str(prof) and "hash" not in prof.get("stats", {}),
+              "profile never leaks password material")
+        hist = await a.request_history()
+        check(len(hist) == 1 and hist[0]["mode"] == "classic",
+              "match history records the race")
+        # guest profile via target id
+        gid = next(p["id"] for p in a.latest["players"] if p["name"] == "G")
+        gprof = await a.request_profile(gid)
+        check(gprof["found"] and gprof["is_guest"] and gprof["stats"] is None,
+              "guest profile is found but has no saved stats")
+        await a.close()
+        await g.close()
+
+
+async def scenario_leaderboard_metrics():
+    print("scenario: leaderboard cycles metrics and scopes by mode")
+    async with Harness() as h:
+        a = Bot("A")
+        b = Bot("B")
+        await a.register(h.uri, "winner_w", "pw1234", token=TOKEN)
+        await b.register(h.uri, "loser_l", "pw1234")
+        await a.ready(True)
+        await b.ready(True)
+        state = await a.wait_for(racing)
+        await a.finish(state["text"])
+        await b.wait_for(lambda s: any(p["name"] == "winner_w" and p["finished"]
+                                       for p in s["players"]))
+        await b.finish(state["text"])
+        await a.wait_for(results)
+
+        wins = await a.request_leaderboard(metric="races_won")
+        check(wins and wins[0]["username"] == "winner_w",
+              "leaderboard sorts by wins")
+        bymode = await a.request_leaderboard(metric="best_wpm", mode="classic")
+        check(len(bymode) == 2, "per-mode leaderboard scopes to classic")
+        empty = await a.request_leaderboard(metric="best_wpm", mode="timed")
+        check(empty == [], "per-mode leaderboard is empty for an unplayed mode")
+        await a.close()
+        await b.close()
+
+
+async def scenario_kick():
+    print("scenario: host kicks a player; kicked account can't rejoin")
+    async with Harness() as h:
+        admin = Bot("Boss")
+        victim = Bot("Victim")
+        await admin.start(h.uri, TOKEN)
+        await victim.register(h.uri, "victim_v", "pw1234")
+        await admin.wait_for(lambda s: any(p["name"] == "victim_v"
+                                           for p in s["players"]))
+        # non-admin kick is ignored
+        vid = next(p["id"] for p in admin.latest["players"] if p["name"] == "victim_v")
+        await victim.kick(admin.id)
+        await asyncio.sleep(0.2)
+        check(any(p["id"] == admin.id for p in victim.latest["players"]),
+              "non-admin kick is ignored")
+        # admin kick removes the victim
+        await admin.kick(vid)
+        await asyncio.sleep(0.3)
+        check(victim.closed_code == P.CLOSE_KICKED, "victim closed with kicked code")
+        check(all(p["name"] != "victim_v" for p in admin.latest["players"]),
+              "victim removed from the roster")
+        # kicked account can't immediately rejoin
+        again = Bot("Victim2")
+        ok = await again.login(h.uri, "victim_v", "pw1234")
+        check(not ok and "removed" in (again.auth_error or ""),
+              "kicked account is refused re-login")
+        await admin.close()
+        await again.close()
+
+
+async def scenario_timed_growth_bounded():
+    print("scenario: TIMED text growth is bounded by the anti-cheat clamp")
+    saved = server_mod.MAX_CPS
+    server_mod.MAX_CPS = 25.0
+    try:
+        async with Harness() as h:
+            a = Bot("A")
+            await a.start(h.uri, TOKEN)
+            h.gs.config["mode"] = "timed"
+            h.gs.config["time_limit"] = 120     # long deadline; we end via cleanup
+            await a.send({"type": P.C_START})
+            await a.wait_for(racing)
+            base_len = len(h.gs.text)
+            for _ in range(40):                 # spam impossible positions/errors
+                await a.progress(10 ** 9, errors=10 ** 9)
+                await asyncio.sleep(0.004)
+            await asyncio.sleep(0.2)
+            grown = len(h.gs.text)
+            check(grown <= base_len + 600,
+                  f"timed text stays bounded ({base_len}->{grown}, not unbounded)")
+            me = a.player("A")
+            check(me["pos"] <= 60, "pos stays clamped despite huge raw_pos")
+            check(me["errors"] <= 60, "errors stay clamped despite huge raw value")
+            check(me["flagged"], "the cheating client is flagged")
+            await a.close()
+    finally:
+        server_mod.MAX_CPS = saved
+
+
+async def scenario_guest_name_sanitized():
+    print("scenario: guest names are stripped of ANSI/control sequences")
+    async with Harness() as h:
+        ws = await connect(h.uri)
+        await ws.send(P.encode({"type": P.C_GUEST, "name": "ev\x1b[31mil\x07",
+                                "version": P.PROTOCOL_VERSION}))
+        raw = await asyncio.wait_for(ws.recv(), timeout=5)
+        msg = P.decode(raw)
+        check(msg.get("type") == P.S_AUTH_OK, "guest with control chars still admitted")
+        check("\x1b" not in msg.get("name", "") and "\x07" not in msg.get("name", ""),
+              f"escape/control chars stripped from guest name -> {msg.get('name')!r}")
+        await ws.close()
+
+
+async def scenario_v1_migration():
+    print("scenario: a v1 accounts file migrates without corruption")
+    fd, path = tempfile.mkstemp(suffix=".json", prefix="typeracer_v1_")
+    os.close(fd)
+    try:
+        v1 = {"users": {"oldie": {
+            "username": "oldie", "salt": os.urandom(16).hex(), "hash": "x" * 64,
+            "stats": {"races_played": 10, "races_won": 3, "best_wpm": 80.0,
+                      "avg_wpm": 75.0, "best_accuracy": 95.0, "avg_accuracy": 90.0,
+                      "total_time": 100.0, "total_chars": 500,
+                      "created": 1.0, "last_played": 2.0}}}}
+        with open(path, "w") as f:
+            json.dump(v1, f)
+        store = AccountStore(path)
+        s = store.stats_for("oldie")
+        check(s["races_played"] == 10 and s["best_wpm"] == 80.0,
+              "v1 stats are preserved through migration")
+        check("by_mode" in s and "history" in s and "achievements" in s,
+              "new schema fields are added")
+        check(s["wpm_sumsq"] > 0,
+              "consistency variance baseline is backfilled for old accounts")
+        # a malformed scope entry must not crash the leaderboard
+        store.users["oldie"]["stats"]["by_mode"] = {"classic": {}}
+        rows = store.leaderboard("best_wpm", mode="classic")
+        check(rows == [], "malformed by_mode scope is handled, not crashed")
+    finally:
+        os.path.exists(path) and os.unlink(path)
+
+
 async def main():
     scenarios = [
         scenario_basic_race,
@@ -545,9 +879,19 @@ async def main():
         scenario_non_dict_auth_rejected,
         scenario_place_renumber_on_disconnect,
         scenario_register_login_persist,
-        scenario_double_login_blocked,
+        scenario_reconnection_takeover,
         scenario_stats_and_leaderboard,
         scenario_guest_no_stats,
+        scenario_config_and_timed_mode,
+        scenario_survival_mode,
+        scenario_anticheat_clamp,
+        scenario_chat,
+        scenario_profile_and_history,
+        scenario_leaderboard_metrics,
+        scenario_kick,
+        scenario_timed_growth_bounded,
+        scenario_guest_name_sanitized,
+        scenario_v1_migration,
     ]
     for scn in scenarios:
         try:

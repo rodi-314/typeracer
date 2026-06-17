@@ -6,10 +6,14 @@ both the server and the client so the two can never disagree on the contract.
 
 import json
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 DEFAULT_WS_PORT = 8765
 DEFAULT_DISCOVERY_PORT = 8766
+
+# WebSocket close codes for application-level disconnects.
+CLOSE_REPLACED = 4000   # this account logged in from elsewhere
+CLOSE_KICKED = 4001     # removed by the host
 
 # ---------------------------------------------------------------------------
 # Game phases (server authoritative, echoed in every state snapshot)
@@ -31,7 +35,12 @@ C_READY = "ready"           # {type, ready: bool}
 C_PROGRESS = "progress"     # {type, pos, errors, keystrokes}
 C_START = "start"           # admin only: force the countdown to begin now
 C_LOBBY = "lobby"           # admin only: abort current race back to the lobby
-C_LEADERBOARD = "leaderboard"  # {type, metric?}: request the global leaderboard
+C_CONFIG = "config"         # admin only: set next-race config {mode?,length?,...}
+C_CHAT = "chat"             # {type, text}: lobby/results chat message
+C_PROFILE = "profile"       # {type, target_id?}: request a player's profile
+C_HISTORY = "history"       # {type}: request your own match history
+C_KICK = "kick"             # admin only: {type, target_id}
+C_LEADERBOARD = "leaderboard"  # {type, metric?, mode?, category?}
 C_PING = "ping"             # {type}
 
 # ---------------------------------------------------------------------------
@@ -40,7 +49,9 @@ C_PING = "ping"             # {type}
 S_AUTH_OK = "auth_ok"       # {type, id, name, account, is_admin, is_guest, stats, version}
 S_AUTH_FAIL = "auth_fail"   # {type, msg}
 S_STATE = "state"           # full snapshot, see GameServer.snapshot()
-S_LEADERBOARD = "leaderboard"  # {type, metric, rows: [...]}
+S_LEADERBOARD = "leaderboard"  # {type, metric, mode, category, rows: [...]}
+S_PROFILE = "profile"       # {type, found, name, is_guest, stats, badges, recent}
+S_HISTORY = "history"       # {type, rows: [...]}
 S_ERROR = "error"           # {type, msg}
 S_PONG = "pong"             # {type}
 
