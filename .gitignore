@@ -1,0 +1,7 @@
+# Runtime account/stats database written by the host
+typeracer_data.json
+*.typeracer_*.tmp
+
+# Python
+__pycache__/
+*.pyc

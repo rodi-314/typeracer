@@ -1,0 +1,3 @@
+# LAN TypeRacer needs only the websockets library (modern asyncio API).
+# Developed and tested against websockets 16.0; any 14+ release works.
+websockets>=14
