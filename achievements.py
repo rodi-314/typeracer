@@ -41,6 +41,35 @@ ACHIEVEMENTS = [
                 lambda s: s.get("longest_streak", 0) >= 3),
     Achievement("streak_5", "Unstoppable", "Win 5 races in a row",
                 lambda s: s.get("longest_streak", 0) >= 5),
+    # -- volume / endurance ------------------------------------------------
+    Achievement("centurion", "Centurion", "Finish 100 races",
+                lambda s: s["races_played"] >= 100),
+    Achievement("marathoner", "Marathoner", "Type 100,000 characters",
+                lambda s: s.get("total_chars", 0) >= 100_000),
+    Achievement("scribe", "Scribe", "Type 1,000,000 characters",
+                lambda s: s.get("total_chars", 0) >= 1_000_000),
+    # -- consistency / precision -------------------------------------------
+    Achievement("metronome", "Metronome", "Reach 90% consistency over 10+ races",
+                lambda s: s.get("consistency", 0) >= 90 and s["races_played"] >= 10),
+    Achievement("perfectionist", "Perfectionist", "Finish 10 flawless races",
+                lambda s: s.get("flawless_races", 0) >= 10),
+    # -- speed -------------------------------------------------------------
+    Achievement("blistering", "Blistering", "Reach 150 WPM",
+                lambda s: s["best_wpm"] >= 150),
+    # -- progression -------------------------------------------------------
+    Achievement("level_10", "Seasoned", "Reach level 10",
+                lambda s: s.get("level", 1) >= 10),
+    Achievement("level_25", "Devoted", "Reach level 25",
+                lambda s: s.get("level", 1) >= 25),
+    Achievement("ranked_up", "Climbing", "Reach Gold tier or higher",
+                lambda s: s.get("tier_index", 0) >= 2),   # Bronze0 Silver1 Gold2
+    Achievement("elite", "Elite", "Reach Diamond tier or higher",
+                lambda s: s.get("tier_index", 0) >= 4),   # Platinum3 Diamond4
+    # -- habit -------------------------------------------------------------
+    Achievement("regular", "Regular", "Play 7 days in a row",
+                lambda s: s.get("longest_day_streak", 0) >= 7),
+    Achievement("dedicated", "Dedicated", "Play 30 days in a row",
+                lambda s: s.get("longest_day_streak", 0) >= 30),
 ]
 
 _BY_ID = {a.id: a for a in ACHIEVEMENTS}

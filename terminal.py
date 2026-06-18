@@ -95,6 +95,22 @@ def strip_color(text):
     return _SGR_RE.sub(repl, text)
 
 
+def remap_sgr(text, mapping):
+    """Rewrite SGR color parameters through ``mapping`` (theme support).
+
+    ``mapping`` is a dict of SGR-parameter strings, e.g. {"32": "94"} to turn
+    green into bright blue. Parameters not in the mapping pass through unchanged,
+    so structural attributes (bold/reverse/reset) are untouched.
+    """
+    if not mapping:
+        return text
+
+    def repl(m):
+        params = [mapping.get(p, p) for p in m.group(1).split(";")]
+        return "\x1b[" + ";".join(params) + "m"
+    return _SGR_RE.sub(repl, text)
+
+
 def enable_ansi():
     """Enable ANSI/VT processing. No-op on POSIX; uses the Win32 console API."""
     if not IS_WINDOWS:

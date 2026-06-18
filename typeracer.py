@@ -22,8 +22,9 @@ from websockets.asyncio.server import serve
 
 import protocol as P
 import netutil
+import config_store
 from accounts import AccountStore, DEFAULT_DATA_FILE
-from server import GameServer
+from server import GameServer, MAX_PLAYERS
 from client import GameClient
 
 
@@ -53,8 +54,14 @@ async def run_host(args):
     lan_ip = netutil.detect_lan_ip(args.subnet)
     admin_token = secrets.token_hex(8)
     store = AccountStore(args.data_file)
+    host_store = config_store.HostConfigStore(args.host_config)
+    saved_config, banned = host_store.load()
     server = GameServer(game_name=args.game_name or f"TypeRacer @ {lan_ip}",
-                        admin_token=admin_token, store=store)
+                        admin_token=admin_token, store=store,
+                        room_password=args.room_password,
+                        max_players=args.max_players, host_store=host_store)
+    server.config = saved_config            # restore the last room setup
+    server.kicked_accounts = set(banned)    # ...and the ban list
 
     join_hint = f"python typeracer.py join {lan_ip}"
     if args.port != P.DEFAULT_WS_PORT:
@@ -63,6 +70,9 @@ async def run_host(args):
     print(f"Hosting '{server.game_name}' on {lan_ip}:{args.port}")
     print(f"Other players join with:  {join_hint}")
     print(f"Accounts/stats stored in: {os.path.abspath(args.data_file)}")
+    if args.room_password:
+        print("This room is PASSWORD PROTECTED "
+              "(players join with --room-password).")
     if not args.no_discovery:
         print("LAN auto-discovery is on (players can also just run: "
               "python typeracer.py join)")
@@ -83,6 +93,7 @@ async def run_host(args):
             host_hint=join_hint,
             prefill_username=default_username(args.name),
             color=color_enabled(args),
+            room_password=args.room_password,
         )
         try:
             await client.run()
@@ -138,6 +149,7 @@ async def run_join(args):
         host_hint=join_hint,
         prefill_username=default_username(args.name),
         color=color_enabled(args),
+        room_password=args.room_password,
     )
     await client.run()
 
@@ -173,6 +185,13 @@ def build_parser():
     host.add_argument("--game-name", help="name shown to discovering players")
     host.add_argument("--data-file", default=DEFAULT_DATA_FILE,
                       help=f"accounts/stats JSON file (default {DEFAULT_DATA_FILE})")
+    host.add_argument("--host-config", default=config_store.DEFAULT_HOST_FILE,
+                      help="room config + ban-list JSON file "
+                           f"(default {config_store.DEFAULT_HOST_FILE})")
+    host.add_argument("--room-password", default=None,
+                      help="require this password to join the room")
+    host.add_argument("--max-players", type=int, default=MAX_PLAYERS,
+                      help=f"max concurrent human players (default {MAX_PLAYERS})")
     host.add_argument("--port", type=int, default=P.DEFAULT_WS_PORT,
                       help=f"websocket port (default {P.DEFAULT_WS_PORT})")
     host.add_argument("--discovery-port", type=int, default=P.DEFAULT_DISCOVERY_PORT,
@@ -188,6 +207,8 @@ def build_parser():
     join = sub.add_parser("join", help="join a game by IP or auto-discovery")
     join.add_argument("host", nargs="?", help="host IP (omit to auto-discover)")
     join.add_argument("--name", help="prefill for your login username")
+    join.add_argument("--room-password", default=None,
+                      help="room password, if the host set one")
     join.add_argument("--port", type=int, default=P.DEFAULT_WS_PORT,
                       help=f"websocket port (default {P.DEFAULT_WS_PORT})")
     join.add_argument("--discovery-port", type=int, default=P.DEFAULT_DISCOVERY_PORT,

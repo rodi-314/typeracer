@@ -13,12 +13,34 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 
 import protocol as P
 import terminal as T
+import client_settings
 from terminal import (
     RESET, BOLD, DIM, REVERSE,
-    FG_RED, FG_GREEN, FG_YELLOW, FG_CYAN, FG_GREY, FG_WHITE, FG_MAGENTA,
+    FG_RED, FG_GREEN, FG_YELLOW, FG_BLUE, FG_CYAN, FG_GREY, FG_WHITE, FG_MAGENTA,
     FG_BRIGHT_GREEN, FG_BRIGHT_CYAN, FG_BRIGHT_RED, BG_RED,
     KEY_ENTER, KEY_BACKSPACE, KEY_ESC, KEY_CTRL_C, KEY_TAB,
 )
+
+# Accent-color name -> ANSI foreground (matches protocol.PLAYER_COLORS).
+COLOR_CODES = {
+    "cyan": FG_CYAN, "green": FG_GREEN, "yellow": FG_YELLOW,
+    "magenta": FG_MAGENTA, "red": FG_BRIGHT_RED, "blue": FG_BLUE,
+    "white": FG_WHITE,
+}
+
+# Color themes as SGR-parameter remaps applied at the render seam. "mono" routes
+# through strip_color (handled in _draw); "colorblind" shifts the green/red typed
+# /error pair onto a deuteranopia-safe blue/yellow axis.
+THEME_MAPS = {
+    "default": {},
+    "high-contrast": {"90": "37", "34": "94", "36": "96", "32": "92",
+                      "33": "93", "31": "91", "35": "95"},
+    "colorblind": {"32": "94", "92": "94", "31": "33", "91": "93",
+                   "41": "43", "42": "44"},
+    "mono": {},
+}
+THEME_ORDER = ("default", "high-contrast", "colorblind", "mono")
+UNIT_ORDER = ("wpm", "cpm", "both")
 
 
 def wrap_indices(text, width):
@@ -44,11 +66,19 @@ def wrap_indices(text, width):
 
 class GameClient:
     def __init__(self, uri, admin_token=None, host_hint="", prefill_username="",
-                 color=True):
+                 color=True, room_password=None):
         self.uri = uri
         self.admin_token = admin_token
         self.host_hint = host_hint
-        self.color_enabled = color
+        self.room_password = room_password
+
+        # Persisted per-machine preferences (color/theme/units/sound/last user).
+        self.settings = client_settings.load()
+        self.base_color = color           # CLI/env gate: False forces mono
+        self.theme = self.settings["theme"]
+        self.units = self.settings["units"]
+        self.sound = self.settings["sound"]
+        self._last_sound_phase = None     # de-dupe terminal-bell cues
 
         self.ws = None
         self.loop = None
@@ -72,7 +102,7 @@ class GameClient:
         # login form state
         self.login_stage = "choose"     # choose | username | password | submitting
         self.login_action = None        # login | register | guest
-        self.field_username = prefill_username or ""
+        self.field_username = prefill_username or self.settings.get("last_username", "")
         self.field_password = ""
         self.login_error = None
 
@@ -86,12 +116,14 @@ class GameClient:
         # profile / history overlays + player selection cursor
         self.profile_data = None
         self.history_data = None
+        self.banlist = []               # banned usernames (admin overlay)
         self.sel_id = None              # selected player id (TAB cycles)
 
         # text compose mode (chat or custom race text)
         self.compose = None             # None | "chat" | "custom"
         self.compose_draft = ""
         self.kick_armed = None          # id pending kick confirmation
+        self.setup_bot_difficulty = "medium"   # host bot tier to spawn next
 
         # live config / chat / mode info from snapshots
         self.config = {}
@@ -101,6 +133,8 @@ class GameClient:
         self.text_category = None
         self.chat_lines = []
         self.announcements = []
+        self.session = None             # running scoreboard across races
+        self.celebration = None         # one-shot winner banner
 
         # latest server snapshot
         self.state = None
@@ -215,6 +249,10 @@ class GameClient:
                     self.history_data = msg.get("rows", [])
                     if self.authed:
                         self.view = "history"
+                elif mtype == P.S_BANLIST:
+                    self.banlist = msg.get("rows", [])
+                    if self.authed:
+                        self.view = "banlist"
                 elif mtype == P.S_ERROR:
                     self.error_msg = msg.get("msg")
                     return
@@ -249,17 +287,37 @@ class GameClient:
             self.chat_lines = msg["chat"]
         if "announcements" in msg:
             self.announcements = msg["announcements"]
+        if "session" in msg:
+            self.session = msg["session"]
+        # celebration arrives once (the first results frame); latch it so it
+        # stays visible for the whole results screen, not a single 30ms frame.
+        if msg.get("celebration"):
+            self.celebration = msg["celebration"]
 
-        if phase == P.PHASE_COUNTDOWN and self.prev_phase != P.PHASE_COUNTDOWN:
+        # A new race begins at the COUNTDOWN transition -- but an instant
+        # countdown (countdown=0 / quick-start) jumps straight to RACING with no
+        # COUNTDOWN frame ever broadcast, so reset on that direct LOBBY/RESULTS ->
+        # RACING jump too. Without this the previous race's finished_local/t_pos
+        # leak in and the next race is untypable.
+        entering_race = (phase == P.PHASE_COUNTDOWN
+                         and self.prev_phase != P.PHASE_COUNTDOWN)
+        instant_race = (phase == P.PHASE_RACING
+                        and self.prev_phase not in (P.PHASE_COUNTDOWN,
+                                                    P.PHASE_RACING))
+        if entering_race or instant_race:
             self._reset_typing(text)
             self.compose = None         # don't let a draft swallow the first char
             self.announcements = []     # clear last race's badge popups
+            self.celebration = None     # and last race's winner banner
             self.view = "game"          # close any overlay so the race takes over
         if phase == P.PHASE_RACING and self.prev_phase != P.PHASE_RACING:
             if text:
                 self.text = text
             if self.local_start is None:
                 self.local_start = time.monotonic()
+            self._beep()                # "GO!"
+        if phase == P.PHASE_RESULTS and self.prev_phase != P.PHASE_RESULTS:
+            self._beep()                # race over
         # TIMED mode grows the passage mid-race; accept the longer text without
         # disturbing the local cursor.
         if phase == P.PHASE_RACING and text and len(text) > len(self.text):
@@ -296,6 +354,9 @@ class GameClient:
         self.view = "game"
         self.sel_id = self.my_id
         self.login_error = None
+        if self.username:
+            self.settings["last_username"] = self.username
+            self._save_settings()
 
     # ===================================================================
     # Input handling
@@ -324,6 +385,9 @@ class GameClient:
         if self.view == "leaderboard":
             await self._handle_leaderboard_key(kind, val)
             return
+        if self.view == "banlist":
+            await self._handle_banlist_key(kind, val)
+            return
         if self.view in ("profile", "history", "help"):
             self.view = "game"      # any key dismisses
             return
@@ -339,7 +403,9 @@ class GameClient:
 
         if kind == "special" and val == KEY_ENTER and self.is_admin \
                 and phase in (P.PHASE_LOBBY, P.PHASE_RESULTS):
-            await self._send({"type": P.C_START})
+            # From results, a clean re-rack; from the lobby, a normal start.
+            kind_msg = P.C_RERACE if phase == P.PHASE_RESULTS else P.C_START
+            await self._send({"type": kind_msg})
             return
         if kind == "special" and val == KEY_TAB:
             await self._cycle_selection()
@@ -353,11 +419,21 @@ class GameClient:
 
     async def _handle_command(self, c, phase):
         in_lobby = phase in (P.PHASE_LOBBY, P.PHASE_RESULTS)
+        # Quick-chat emotes: number keys, usable in the lobby/results and (for
+        # spectators/eliminated/finished players) mid-race. Active typists never
+        # reach here -- their keys go to the typing handler.
+        if c.isdigit():
+            idx = int(c) - 1
+            if 0 <= idx < len(P.EMOTE_ORDER):
+                await self._send({"type": P.C_EMOTE, "code": P.EMOTE_ORDER[idx]})
+            return
         if c == "q":
             self.exit_reason = "Thanks for racing!"
             self.running = False
         elif c == "?":
             self.view = "help"
+        elif c == "o" and not self.is_guest:
+            await self._cycle_my_color()
         elif c == "l":
             await self._send({"type": P.C_LEADERBOARD,
                               "metric": self.leaderboard_metric,
@@ -367,7 +443,19 @@ class GameClient:
         elif c == "h":
             await self._send({"type": P.C_HISTORY})
         elif c == "c":
-            self.color_enabled = not self.color_enabled
+            i = THEME_ORDER.index(self.theme) if self.theme in THEME_ORDER else 0
+            self.theme = THEME_ORDER[(i + 1) % len(THEME_ORDER)]
+            self.settings["theme"] = self.theme
+            self._save_settings()
+        elif c == "u":
+            i = UNIT_ORDER.index(self.units) if self.units in UNIT_ORDER else 0
+            self.units = UNIT_ORDER[(i + 1) % len(UNIT_ORDER)]
+            self.settings["units"] = self.units
+            self._save_settings()
+        elif c == "s":
+            self.sound = not self.sound
+            self.settings["sound"] = self.sound
+            self._save_settings()
         elif in_lobby and c == "r":
             await self._toggle_ready()
         elif in_lobby and c == "t":
@@ -377,6 +465,28 @@ class GameClient:
             self.view = "setup"
         elif in_lobby and c == "k" and self.is_admin:
             await self._kick_selected()
+        elif in_lobby and c == "b" and self.is_admin:
+            await self._send({"type": P.C_BANLIST})
+
+    async def _cycle_my_color(self):
+        me = self._my_player()
+        cur = me.get("color") if me else None
+        colors = list(P.PLAYER_COLORS)
+        try:
+            i = colors.index(cur)
+        except ValueError:
+            i = -1
+        await self._send({"type": P.C_SETCOLOR,
+                          "color": colors[(i + 1) % len(colors)]})
+
+    async def _handle_banlist_key(self, kind, val):
+        if kind == "char" and val.isdigit():
+            idx = int(val) - 1
+            if 0 <= idx < len(self.banlist):
+                await self._send({"type": P.C_UNBAN, "username": self.banlist[idx]})
+                await self._send({"type": P.C_BANLIST})     # refresh the list
+            return
+        self.view = "game"
 
     async def _cycle_selection(self):
         ids = [p["id"] for p in (self.state or {}).get("players", [])
@@ -429,6 +539,7 @@ class GameClient:
         self.finished_local = True
         if self.local_start is not None:
             self.local_finish_time = time.monotonic() - self.local_start
+        self._beep()
         await self._send_progress(force=True)
 
     async def _send_progress(self, force=False):
@@ -447,6 +558,54 @@ class GameClient:
         me = self._my_player()
         current = bool(me and me["ready"])
         await self._send({"type": P.C_READY, "ready": not current})
+
+    # -- preferences / units / sound ---------------------------------------
+    def _save_settings(self):
+        client_settings.save(self.settings)
+
+    def _fmt_speed(self, wpm):
+        """Format a speed for the HUD/racetrack, honoring the units preference."""
+        w = int(round(wpm))
+        if self.units == "cpm":
+            return f"{w * 5}"
+        if self.units == "both":
+            return f"{w}w/{w * 5}c"
+        return f"{w}"
+
+    def _table_speed(self, wpm):
+        """Numeric speed for fixed-width tables (both -> primary WPM)."""
+        return int(round(wpm)) * (5 if self.units == "cpm" else 1)
+
+    def _speed_tail(self, wpm):
+        """Speed + lowercase unit suffix for the free-form racetrack tail."""
+        s = self._fmt_speed(wpm)
+        if self.units == "both":
+            return s
+        return s + ("cpm" if self.units == "cpm" else "wpm")
+
+    def _unit_label(self):
+        return "CPM" if self.units == "cpm" else "WPM"
+
+    def _beep(self):
+        if self.sound:
+            T.write("\a")
+
+    _SPARK = " .:-=+*#%@"
+
+    def _sparkline(self, samples, width=24):
+        """ASCII WPM-over-time sparkline (cross-platform; no unicode blocks)."""
+        vals = [float(v) for v in (samples or []) if isinstance(v, (int, float))]
+        if not vals:
+            return ""
+        if len(vals) > width:                # downsample to fit
+            step = len(vals) / width
+            vals = [vals[int(i * step)] for i in range(width)]
+        lo, hi = min(vals), max(vals)
+        rng = (hi - lo) or 1.0
+        ramp = self._SPARK
+        return "".join(
+            ramp[max(0, min(len(ramp) - 1, int((v - lo) / rng * (len(ramp) - 1))))]
+            for v in vals)
 
     # -- compose (chat / custom text) --------------------------------------
     async def _handle_compose_key(self, kind, val):
@@ -506,8 +665,33 @@ class GameClient:
         elif c == "x":
             self.compose = "custom"
             self.compose_draft = ""
+        elif c == "b":
+            self._cycle_bot_difficulty(opts.get("bot_difficulties", []))
+        elif c == "a":
+            await self._send({"type": P.C_ADD_BOT,
+                              "difficulty": self.setup_bot_difficulty})
+        elif c == "z":
+            await self._send({"type": P.C_REMOVE_BOT})
+        elif c == "o":
+            await self._cycle_config("countdown", opts.get("countdowns", []))
+        elif c == "i":
+            await self._send({"type": P.C_CONFIG,
+                              "quick_start": not self.config.get("quick_start")})
+        elif c == "n":
+            await self._cycle_config("min_players", [1, 2, 3, 4, 5, 6, 7, 8])
+        elif c == "e":
+            await self._cycle_config("rematch_secs", opts.get("rematch_secs", []))
         elif c == "q":
             self.view = "game"
+
+    def _cycle_bot_difficulty(self, options):
+        if not options:
+            options = ["easy", "medium", "hard", "insane", "rival"]
+        try:
+            i = options.index(self.setup_bot_difficulty)
+        except ValueError:
+            i = -1
+        self.setup_bot_difficulty = options[(i + 1) % len(options)]
 
     async def _cycle_config(self, field, options):
         if not options:
@@ -598,19 +782,23 @@ class GameClient:
         self.login_stage = "submitting"
         self.login_error = None
         token = self.admin_token
+        rp = self.room_password
         if self.login_action == "guest":
             await self._send({"type": P.C_GUEST, "name": self.field_username.strip(),
-                              "token": token, "version": P.PROTOCOL_VERSION})
+                              "token": token, "room_password": rp,
+                              "version": P.PROTOCOL_VERSION})
         elif self.login_action == "register":
             await self._send({"type": P.C_REGISTER,
                               "username": self.field_username.strip(),
                               "password": self.field_password,
-                              "token": token, "version": P.PROTOCOL_VERSION})
+                              "token": token, "room_password": rp,
+                              "version": P.PROTOCOL_VERSION})
         else:  # login
             await self._send({"type": P.C_LOGIN,
                               "username": self.field_username.strip(),
                               "password": self.field_password,
-                              "token": token, "version": P.PROTOCOL_VERSION})
+                              "token": token, "room_password": rp,
+                              "version": P.PROTOCOL_VERSION})
 
     # ===================================================================
     # State helpers
@@ -675,6 +863,7 @@ class GameClient:
             "profile": self._frame_profile,
             "history": self._frame_history,
             "help": self._frame_help,
+            "banlist": self._frame_banlist,
         }.get(self.view)
         if overlay is not None:
             self._draw(overlay(cols), cols, rows)
@@ -702,8 +891,12 @@ class GameClient:
             out.append("\r\n")
         out.append(T.CLEAR_BELOW)
         frame = "".join(out)
-        if not self.color_enabled:
+        if not self.base_color or self.theme == "mono":
             frame = T.strip_color(frame)
+        else:
+            mapping = THEME_MAPS.get(self.theme)
+            if mapping:
+                frame = T.remap_sgr(frame, mapping)
         T.write(frame)
 
     def _clip(self, line, cols):
@@ -762,13 +955,15 @@ class GameClient:
 
     def _controls(self, results=False):
         ready = "rematch" if results else "ready"
-        base = (f"R {ready}   T chat   TAB select   P profile   H history   "
-                "L board   ?=help   Q quit")
+        base = (f"R {ready}   T chat   1-8 emote   TAB select   P profile   "
+                "H history   L board   ?=help   Q quit")
         L = ["  " + FG_GREY + base + RESET]
+        if not self.is_guest:
+            L.append("  " + FG_GREY + "O accent color" + RESET)
         if self.is_admin:
             startlbl = "rematch now" if results else "start now"
             L.append("  " + FG_GREY + f"host:  Enter {startlbl}   M setup   "
-                     "K kick selected" + RESET)
+                     "K kick   B bans" + RESET)
         return L
 
     def _identity_line(self):
@@ -799,6 +994,11 @@ class GameClient:
         diff = c.get("difficulty")
         if diff:
             parts.append({1: "easy", 2: "medium", 3: "hard"}.get(diff, str(diff)))
+        if c.get("quick_start"):
+            parts.append("quick")
+        cd = c.get("countdown")
+        if cd == 0:
+            parts.append("instant start")
         return " - ".join(str(p) for p in parts)
 
     def _chat_panel(self, cols, max_lines=6):
@@ -809,6 +1009,11 @@ class GameClient:
         for c in lines:
             if c.get("kind") == "system":
                 L.append("    " + FG_GREY + "* " + c.get("text", "") + RESET)
+            elif c.get("kind") == "emote":
+                you = c.get("id") == self.my_id
+                col = FG_BRIGHT_CYAN if you else FG_CYAN
+                L.append("    " + col + c.get("name", "?") + RESET
+                         + FG_YELLOW + " " + c.get("text", "") + RESET)
             else:
                 you = c.get("id") == self.my_id
                 col = FG_BRIGHT_CYAN if you else FG_CYAN
@@ -819,6 +1024,72 @@ class GameClient:
                      + " " + RESET)
         return L
 
+    # -- session scoreboard / celebration / popups --------------------------
+    def _session_summary_line(self):
+        s = self.session or {}
+        st = s.get("standings", [])
+        if not st or s.get("race_no", 0) < 1:
+            return None
+        leader = st[0]
+        return ("  " + FG_GREY + "Session: " + RESET + BOLD
+                + leader.get("name", "") + RESET + FG_GREY
+                + f" leads, {leader.get('points', 0)} pts after "
+                f"{s.get('race_no', 0)} race(s)" + RESET)
+
+    def _session_panel(self, max_rows=6):
+        s = self.session or {}
+        standings = s.get("standings", [])
+        if not standings or s.get("race_no", 0) < 1:
+            return []
+        L = ["  " + BOLD + "Session standings" + RESET + FG_GREY
+             + f"   after {s.get('race_no', 0)} race(s)" + RESET,
+             "  " + BOLD
+             + f"{'#':<3} {'Player':<16} {'Pts':>4} {'W':>3} {'Best':>5}" + RESET]
+        for i, e in enumerate(standings[:max_rows], 1):
+            you = e.get("name") == self.username
+            bp = e.get("best_place")
+            best = ("#" + str(bp)) if bp else "-"
+            row = (f"{i:<3} {e.get('name', '')[:16]:<16} {e.get('points', 0):>4} "
+                   f"{e.get('wins', 0):>3} {best:>5}")
+            if you:
+                row = BOLD + FG_BRIGHT_CYAN + row + RESET
+            elif i == 1:
+                row = FG_YELLOW + row + RESET
+            L.append("  " + row)
+        return L
+
+    def _celebration_lines(self):
+        c = self.celebration
+        if not c:
+            return []
+        flagtxt = {"flawless": "FLAWLESS", "photo_finish": "PHOTO FINISH",
+                   "streak": "ON A STREAK", "upset": "UPSET"}
+        tags = "  ".join(flagtxt[f] for f in c.get("flags", []) if f in flagtxt)
+        botmark = FG_GREY + " [bot]" + RESET if c.get("is_bot") else ""
+        out = ["  " + BOLD + FG_YELLOW + "WINNER  " + RESET + BOLD
+               + c.get("winner", "") + RESET + botmark + FG_BRIGHT_CYAN
+               + f"   {c.get('wpm', 0)} WPM" + RESET]
+        if tags:
+            out.append("  " + FG_YELLOW + "* " + tags + " *" + RESET)
+        return out
+
+    def _announcement_line(self, a):
+        kind = a.get("kind", "badge")
+        name = a.get("name", "")
+        if kind == "level":
+            return ("  " + FG_BRIGHT_CYAN + "^ " + RESET + BOLD + name + RESET
+                    + FG_BRIGHT_CYAN + f" reached level {a.get('level')}!" + RESET)
+        if kind == "pb":
+            return ("  " + FG_YELLOW + "* " + RESET + BOLD + name + RESET
+                    + FG_YELLOW + f" new {a.get('pb_kind')} best: "
+                    + f"{a.get('new')} (was {a.get('old')})" + RESET)
+        if kind == "daystreak":
+            return ("  " + FG_MAGENTA + "+ " + RESET + BOLD + name + RESET
+                    + FG_MAGENTA + f" on a {a.get('days')}-day streak!" + RESET)
+        return ("  " + FG_YELLOW + "* " + RESET + BOLD + name + RESET
+                + FG_YELLOW + " earned " + BOLD + a.get("badge", "") + RESET
+                + FG_YELLOW + "!" + RESET)
+
     # -- lobby --------------------------------------------------------------
     def _frame_lobby(self, cols):
         L = self._banner()
@@ -826,6 +1097,9 @@ class GameClient:
         L.append(self._identity_line())
         L.append("  " + FG_GREY + "Next race:  " + RESET + BOLD
                  + self._config_summary() + RESET)
+        sess = self._session_summary_line()
+        if sess:
+            L.append(sess)
         L.append("")
         L.append("  " + BOLD + FG_CYAN + "LOBBY" + RESET
                  + "   others join with:  " + FG_YELLOW + self.host_hint + RESET)
@@ -842,7 +1116,10 @@ class GameClient:
     def _lobby_row(self, p):
         you = p["id"] == self.my_id
         sel = (FG_YELLOW + "> " + RESET) if p["id"] == self.sel_id else "  "
-        name = (BOLD + p["name"] + RESET) if you else p["name"]
+        if you:
+            name = BOLD + p["name"] + RESET
+        else:
+            name = self._color_code(p.get("color")) + p["name"] + RESET
         tag = FG_GREY + " (you)" + RESET if you else ""
         host = " " + FG_MAGENTA + "[host]" + RESET if p["is_admin"] else ""
         status = (FG_BRIGHT_GREEN + "READY" + RESET) if p["ready"] \
@@ -850,14 +1127,31 @@ class GameClient:
         if p.get("idle"):
             status += FG_GREY + " (idle)" + RESET
         stats = p.get("stats")
-        if p.get("is_guest"):
+        if p.get("is_bot"):
+            diff = (p.get("difficulty") or "bot").capitalize()
+            host = " " + FG_MAGENTA + f"[bot:{diff}]" + RESET
+            extra = ""
+        elif p.get("is_guest"):
             extra = FG_GREY + "  guest" + RESET
         elif stats:
-            extra = (FG_GREY + f"  {stats['best_wpm']}wpm best, "
+            badge = self._rank_badge(p)
+            extra = (FG_GREY + f"  {badge}{stats['best_wpm']}wpm best, "
                      f"{stats['races']}r" + RESET)
         else:
             extra = ""
         return f"{sel}{name}{tag}{host}  -  {status}{extra}"
+
+    def _rank_badge(self, p):
+        """Compact 'Lv7 Gold ' prefix for an accounted player, when present."""
+        stats = p.get("stats") or {}
+        lvl = p.get("level") or stats.get("level")
+        tier = p.get("tier") or stats.get("tier")
+        bits = []
+        if lvl:
+            bits.append(f"Lv{lvl}")
+        if tier:
+            bits.append(tier)
+        return (" ".join(bits) + " ") if bits else ""
 
     # -- countdown ----------------------------------------------------------
     def _frame_countdown(self, cols):
@@ -883,16 +1177,18 @@ class GameClient:
         L = []
         elapsed = self._local_elapsed()
         wpm, acc, pct = self._local_stats()
+        ulbl = self._unit_label()
         if self.mode == "timed" and self.time_left is not None:
             L.append(
                 "  " + BOLD + "TIME LEFT " + RESET + FG_BRIGHT_CYAN
                 + f"{self.time_left:5.1f}s" + RESET
-                + "   " + BOLD + "WPM " + RESET + f"{wpm:3d}"
+                + "   " + BOLD + ulbl + " " + RESET + self._fmt_speed(wpm)
                 + "   " + BOLD + "ACC " + RESET + f"{acc:5.1f}%"
                 + "   " + BOLD + "CHARS " + RESET + f"{self.t_pos}")
         else:
             head = ("  " + BOLD + "TIME " + RESET + f"{elapsed:5.1f}s"
-                    + "   " + BOLD + "WPM " + RESET + FG_BRIGHT_CYAN + f"{wpm:3d}" + RESET
+                    + "   " + BOLD + ulbl + " " + RESET + FG_BRIGHT_CYAN
+                    + self._fmt_speed(wpm) + RESET
                     + "   " + BOLD + "ACC " + RESET + f"{acc:5.1f}%"
                     + "   " + BOLD + "DONE " + RESET + f"{pct:3d}%")
             if self.mode == "survival":
@@ -978,26 +1274,31 @@ class GameClient:
             name = BOLD + name + RESET
         bar = self._bar(frac, barw)
         flag = (" " + FG_BRIGHT_RED + "!" + RESET) if p.get("flagged") else ""
+        bubble = self._emote_bubble(p)
         if p.get("eliminated"):
-            return f"{name} {FG_GREY}{bar}{RESET} {FG_GREY}OUT{RESET}{flag}"
+            return f"{name} {FG_GREY}{bar}{RESET} {FG_GREY}OUT{RESET}{flag}{bubble}"
         if p["finished"]:
             tail = (self._place_label(p["place"])
-                    + f"  {p['wpm']:3d}wpm {p['acc']:5.1f}%  {p['finish_time']:5.1f}s")
-            return f"{name} {FG_BRIGHT_GREEN}{bar}{RESET} {tail}{flag}"
-        tail = f"{int(frac * 100):3d}% {wpm:3d}wpm"
+                    + f"  {self._speed_tail(p['wpm'])} {p['acc']:5.1f}%  "
+                    f"{p['finish_time']:5.1f}s")
+            return f"{name} {FG_BRIGHT_GREEN}{bar}{RESET} {tail}{flag}{bubble}"
+        tail = f"{int(frac * 100):3d}% {self._speed_tail(wpm)}"
         if self.mode == "survival" and p.get("lives") is not None:
             tail += " " + FG_BRIGHT_RED + ("o" * p["lives"]) + RESET
-        color = FG_BRIGHT_CYAN if you else FG_WHITE
-        return f"{name} {color}{bar}{RESET} {tail}{flag}"
+        # Each racer's bar takes their accent color (you stay bright cyan).
+        color = FG_BRIGHT_CYAN if you else self._color_code(p.get("color"))
+        return f"{name} {color}{bar}{RESET} {tail}{flag}{bubble}"
 
     # -- results ------------------------------------------------------------
     def _frame_results(self, cols):
         L = self._banner()
         L.append("")
+        cel = self._celebration_lines()
+        if cel:
+            L += cel
+            L.append("")
         for a in self.announcements:
-            L.append("  " + FG_YELLOW + "* " + RESET + BOLD + a.get("name", "")
-                     + RESET + FG_YELLOW + " earned " + BOLD + a.get("badge", "")
-                     + RESET + FG_YELLOW + "!" + RESET)
+            L.append(self._announcement_line(a))
         if self.announcements:
             L.append("")
         L.append("  " + BOLD + FG_BRIGHT_CYAN + "RACE RESULTS" + RESET
@@ -1008,7 +1309,8 @@ class GameClient:
             key=lambda p: (p["place"] or 999),
         )
         L.append("  " + BOLD
-                 + f"{'Rank':<5} {'Player':<18} {'WPM':>4} {'Acc':>6} {'Time':>8}"
+                 + f"{'Rank':<5} {'Player':<18} {self._unit_label():>4} "
+                 + f"{'Acc':>6} {'Time':>8}"
                  + RESET)
         for p in players:
             you = p["id"] == self.my_id
@@ -1020,18 +1322,36 @@ class GameClient:
                 t = f"{p['finish_time']:.1f}s"
             else:
                 t = "--"
-            row = f"{rank:<5} {name:<18} {p['wpm']:>4} {p['acc']:>5.1f}% {t:>8}"
+            row = (f"{rank:<5} {name:<18} {self._table_speed(p['wpm']):>4} "
+                   f"{p['acc']:>5.1f}% {t:>8}")
             if you:
                 row = BOLD + FG_BRIGHT_CYAN + row + RESET
             elif p["place"] == 1:
                 row = FG_YELLOW + row + RESET
             L.append("  " + row)
+        # Per-racer WPM-over-time sparklines (results-only data).
+        paced = [p for p in players if p.get("splits")]
+        if paced:
+            L.append("")
+            L.append("  " + BOLD + "Pace" + RESET + FG_GREY
+                     + "  (WPM over the race, slow .. fast)" + RESET)
+            for p in paced[:6]:
+                sp = p["splits"]
+                L.append("    " + f"{p['name'][:12]:<12} " + FG_BRIGHT_CYAN
+                         + self._sparkline(sp) + RESET + FG_GREY
+                         + f"  {int(min(sp))}-{int(max(sp))}" + RESET)
         L.append("")
-        ready = sum(1 for p in self.state["players"] if p["connected"] and p["ready"])
-        total = sum(1 for p in self.state["players"] if p["connected"])
+        ready = sum(1 for p in self.state["players"]
+                    if p["connected"] and not p.get("is_bot") and p["ready"])
+        total = sum(1 for p in self.state["players"]
+                    if p["connected"] and not p.get("is_bot"))
         L.append("  " + FG_GREY + f"Ready for another race: {ready}/{total}" + RESET)
+        session = self._session_panel(max_rows=5)
+        if session:
+            L.append("")
+            L += session
         L.append("")
-        L += self._chat_panel(cols, max_lines=4)
+        L += self._chat_panel(cols, max_lines=3)
         L.append("")
         L += self._controls(results=True)
         return L
@@ -1151,6 +1471,24 @@ class GameClient:
             L.append(row("V", "Lives", c.get("lives", 3)))
         L.append(row("X", "Custom text", "(set)" if c.get("has_custom") else "none"))
         L.append("")
+        # AI bots ---------------------------------------------------------
+        nbots = sum(1 for p in (self.state or {}).get("players", [])
+                    if p.get("is_bot"))
+        L.append("  " + BOLD + FG_BRIGHT_CYAN + "AI bots" + RESET
+                 + FG_GREY + f"   {nbots} in the room" + RESET)
+        L.append(row("B", "Add tier", self.setup_bot_difficulty.capitalize()))
+        L.append("    " + FG_GREY + "[A] add a bot   [Z] remove the last bot"
+                 + RESET)
+        L.append("")
+        # Flow knobs --------------------------------------------------------
+        L.append("  " + BOLD + FG_BRIGHT_CYAN + "Flow" + RESET)
+        cd = c.get("countdown", 3)
+        L.append(row("O", "Countdown", "instant" if cd == 0 else f"{cd}s"))
+        L.append(row("I", "Quick start", "on" if c.get("quick_start") else "off"))
+        L.append(row("N", "Min players", c.get("min_players", 1)))
+        rs = c.get("rematch_secs", 0)
+        L.append(row("E", "Auto-rematch", "off" if not rs else f"{rs}s"))
+        L.append("")
         if self.compose == "custom":
             L.append("  " + FG_YELLOW + "Type a custom passage (Enter saves, "
                      "Esc cancels; blank clears):" + RESET)
@@ -1238,17 +1576,22 @@ class GameClient:
             ("Lobby & Results", ""),
             ("R", "ready up / rematch"),
             ("T", "type a chat message"),
+            ("1-8", "quick-chat emote (also mid-race as a spectator)"),
             ("TAB", "select a player (for profile / kick)"),
             ("P", "view selected player's profile + badges"),
             ("H", "your own match history"),
             ("L", "leaderboard  ( [ ] cycle metric )"),
-            ("C", "toggle colors on/off"),
+            ("O", "cycle your accent color (accounts only)"),
+            ("C", "cycle color theme (default/contrast/colorblind/mono)"),
+            ("U", "WPM / CPM / both units"),
+            ("S", "sound cues on/off"),
             ("?", "this help screen"),
             ("Q / Esc", "quit"),
             ("Host only", ""),
             ("Enter", "start / rematch now"),
-            ("M", "race setup: mode, length, category, custom text"),
+            ("M", "setup: mode, length, bots, countdown, quick-start, flow"),
             ("K", "kick the selected player (press twice to confirm)"),
+            ("B", "view + manage the ban list"),
             ("While racing", ""),
             ("type", "match the text; Backspace fixes the current spot"),
         ]
@@ -1261,3 +1604,28 @@ class GameClient:
         L.append("")
         L.append("  " + FG_GREY + "Any key to go back" + RESET)
         return L
+
+    def _frame_banlist(self, cols):
+        L = self._banner()
+        L.append("")
+        L.append("  " + BOLD + FG_BRIGHT_CYAN + "BANNED ACCOUNTS" + RESET
+                 + FG_GREY + "   (host only)" + RESET)
+        L.append("")
+        rows = self.banlist or []
+        if not rows:
+            L.append("  " + FG_GREY + "No one is banned." + RESET)
+        for i, name in enumerate(rows[:9], 1):
+            L.append("    " + BOLD + f"[{i}]" + RESET + " " + name)
+        L.append("")
+        L.append("  " + FG_GREY + "Press a number to un-ban   any other key to "
+                 "go back" + RESET)
+        return L
+
+    def _color_code(self, name):
+        return COLOR_CODES.get(name, FG_WHITE)
+
+    def _emote_bubble(self, p):
+        code = p.get("recent_emote")
+        if not code or code not in P.EMOTES:
+            return ""
+        return "  " + FG_YELLOW + "(" + P.EMOTES[code] + ")" + RESET
